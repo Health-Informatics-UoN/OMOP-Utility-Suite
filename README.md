@@ -15,32 +15,21 @@ While the suite is optimized for CDM v5.4, it has been successfully tested for a
 
 ## Installation & Setup
 
-### Local Development
+### Local Deployment
 
 This project utilizes uv for lightning-fast Python dependency management.
 
-1. Navigate to the backend directory:
+Navigate to the project directory, build the front end files and start the server:
 
     ```Bash
-    cd <path_to_project>/backend
-    ```
-
-2. Sync dependencies:
-
-    ```Bash
-    uv sync
-    ```
-
-3. Start the development server:
-
-    ```Bash
-    uvicorn main:app --port 8080 --reload
+    cd frontend && npm run build   # outputs to backend/frontend/
+    cd ../backend && uvicorn main:app
     ```
 
 ### Running with Docker
 
 For a production-ready environment or quick testing, use Docker Compose:
 
-```Bash
-docker-compose up -d
-```
+    ```Bash
+    docker-compose up --build
+    ```
