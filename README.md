@@ -4,11 +4,7 @@ OMOP Utility Suite is a streamlined web application built with FastAPI. It is de
 
 ## Key Features
 
-- FastAPI Powered: High-performance, asynchronous backend for handling large-scale data operations.
-
-- CDM Compatibility: Primary support for CDM v5.4, with proven backwards compatibility for migrating/appending data from v5.3.
-
-- Docker Ready: Fully containerized for rapid deployment across any environment.
+- OMOP CDM Merging - Upsert data from one postgresql OMOP CDM database to another.
 
 ## Supported CDM Versions
 
