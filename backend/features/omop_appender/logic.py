@@ -16,6 +16,7 @@ Contains:
 import json
 import re
 import sys
+from array import array
 from datetime import datetime
 from typing import AsyncGenerator
 
@@ -35,6 +36,30 @@ from .constants import (
     PERSON_AUDIT_CAP,
 )
 from .models import DBConfig, MergeConfig, ScanRequest
+
+
+# array("q") is a signed 64-bit buffer; some sources type OMOP ids as wide
+# NUMERIC and generate values beyond bigint range (> 2^63-1). Such an id can
+# never be a *target* value (target columns are int/bigint), but it can appear
+# as a *source* lookup key, which we only ever hold in memory and resolve via
+# the remapper — so we keep the compact array where values fit and fall back to
+# a plain Python list (arbitrary precision) only for the column that overflows.
+_Q_MIN = -(1 << 63)
+_Q_MAX = (1 << 63) - 1
+
+
+def _append_id(container, value: int):
+    """
+    Append ``value`` to ``container``, which starts as an ``array("q")`` for
+    memory efficiency. If ``value`` exceeds signed 64-bit range and the
+    container is still an array, upgrade it to a plain ``list`` first. Returns
+    the container to use going forward (a new list object after an upgrade,
+    otherwise the same object).
+    """
+    if type(container) is array and not (_Q_MIN <= value <= _Q_MAX):
+        container = list(container)
+    container.append(value)
+    return container
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +643,123 @@ def build_clinical_source_query(schema: str, table: str, pfk: str,
 
 
 # ---------------------------------------------------------------------------
+# Self-referencing FK second pass
+# ---------------------------------------------------------------------------
+
+async def apply_deferred_selfrefs(
+    tgt, ts, table_name, self_pk, self_remaps, deferred, remapper,
+    batch=20_000,
+):
+    """
+    Second pass for self-referencing FK columns, e.g.
+    visit_occurrence.preceding_visit_occurrence_id and
+    visit_detail.parent_visit_detail_id / preceding_visit_detail_id.
+
+    Why a second pass
+    -----------------
+    A self-referencing FK points at another row of the *same* table, which
+    may not have been inserted yet when the referencing row is processed —
+    the source cursor yields rows in arbitrary order, and a "preceding"
+    visit can legitimately appear *after* the visit that references it.
+    Remapping such a column inline (via IDRemapper.remap during the insert
+    loop) would resolve every forward reference to None and silently NULL
+    it. Worse, if the column is left carrying the raw *source* id, a source
+    that uses BIGINT ids will overflow a target INT column and abort the
+    insert — which is the failure mode this fixes.
+
+    So during the insert pass these columns are written as NULL and their
+    source values stashed in `deferred`. By the time we get here the
+    remapper holds the complete source->target map for this table, so every
+    in-scope reference resolves correctly regardless of insertion order.
+    References whose target row was not part of this merge (out of scope,
+    filtered by patient sampling, or dedup-skipped) resolve to None and are
+    left NULL — the same, spec-valid outcome as before, just no longer the
+    *only* outcome.
+
+    Memory & round-trips
+    --------------------
+    `deferred` is a dict {col: (self_ids, src_refs)} where each value is a
+    pair of `array('q')` columns (see the merge loop). Arrays store 8 bytes
+    per id rather than the ~250 bytes a list-of-dicts costs, so even a few
+    million deferred rows stay well under 100 MB — the previous list form
+    roughly doubled the per-visit footprint already held by the remapper
+    and could tip a full run into swap.
+
+    Each batch of `batch` rows is applied with ONE set-based statement:
+
+        UPDATE ... v SET col = d.tgt
+        FROM unnest($1::bigint[], $2::bigint[]) AS d(self_id, tgt)
+        WHERE v.self_pk = d.self_id
+
+    i.e. N/batch round-trips instead of one UPDATE per row.
+
+    This is a generator: it yields human-readable progress strings so the
+    caller can surface them on the NDJSON stream (the insert phase and this
+    phase are otherwise silent within a table). The final item yielded is
+    the ("__done__", remapped, left_null) sentinel tuple.
+    """
+    remapped = 0
+    left_null = 0
+
+    for col, map_name in self_remaps.items():
+        self_ids, src_refs = deferred.get(col, (None, None))
+        n = 0 if self_ids is None else len(self_ids)
+        if n == 0:
+            continue
+
+        sql = (
+            f'UPDATE "{ts}"."{table_name}" AS v '
+            f'SET "{col}" = d.tgt '
+            f'FROM unnest($1::bigint[], $2::bigint[]) AS d(self_id, tgt) '
+            f'WHERE v."{self_pk}" = d.self_id'
+        )
+
+        col_remapped = 0
+        for start in range(0, n, batch):
+            end = min(start + batch, n)
+            ids_batch: list[int] = []
+            tgt_batch: list[int] = []
+            for i in range(start, end):
+                tgt_ref = remapper.remap(map_name, src_refs[i])
+                if tgt_ref is None:
+                    left_null += 1
+                    continue
+                ids_batch.append(int(self_ids[i]))
+                tgt_batch.append(int(tgt_ref))
+
+            if not ids_batch:
+                continue
+
+            sp = f"sr_{start:x}"
+            await tgt.execute(f"SAVEPOINT {sp}")
+            try:
+                await tgt.execute(sql, ids_batch, tgt_batch)
+                await tgt.execute(f"RELEASE SAVEPOINT {sp}")
+            except asyncpg.PostgresError as e:
+                try:
+                    await tgt.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    await tgt.execute(f"RELEASE SAVEPOINT {sp}")
+                except Exception:
+                    pass
+                # A set-based UPDATE can't name the single offending row, so
+                # surface the first pair of the failed batch as representative
+                # context — enough for the structured error handler to render.
+                raise MergeRowError(
+                    table=table_name, sql=sql,
+                    cols=[self_pk, col],
+                    values=(ids_batch[0], tgt_batch[0]),
+                    cause=e,
+                ) from e
+
+            remapped += len(ids_batch)
+            col_remapped += len(ids_batch)
+            yield (f"{table_name}.{col}: {col_remapped:,}/{n:,} "
+                   f"self-references resolved…")
+
+    yield ("__done__", remapped, left_null)
+
+
+# ---------------------------------------------------------------------------
 # Scan endpoint generator
 # ---------------------------------------------------------------------------
 
@@ -1080,17 +1222,42 @@ async def run_merge(cfg: MergeConfig) -> AsyncGenerator[str, None]:
                     await pk_counter.init_table(tgt, ts, table_name, self_pk)
 
                 insert_cols = list(common_cols)
+
+                # Self-referencing FK columns (map target == this table) are
+                # deferred to a post-insert UPDATE pass — see
+                # apply_deferred_selfrefs for why. Everything else is remapped
+                # inline as before.
+                self_remaps   = {c: m for c, m in fk_remaps.items()
+                                 if m == table_name and c in insert_cols}
+                inline_remaps = {c: m for c, m in fk_remaps.items()
+                                 if m != table_name}
+                # Per self-ref column: two parallel int64 arrays,
+                # (target self_pk id, source ref value). 8 bytes each vs the
+                # ~250 bytes/row a list-of-dicts costs — keeps a multi-million
+                # row visit table's second-pass buffer under ~100 MB instead
+                # of tipping the process into swap.
+                deferred_selfref = {
+                    c: (array("q"), array("q")) for c in self_remaps
+                }
+
                 inserter = (
                     BatchInserter(tgt, ts, table_name, insert_cols)
                     if not cfg.dry_run else None
                 )
                 inserted = skipped = 0
+                staged = 0
 
                 sample_ids = list(person_map.keys()) if limit is not None else None
                 sql, args = build_clinical_source_query(
                     ss, table_name, pfk, sample_ids
                 )
+                scanned = 0
                 async for row in iter_rows(src, sql, *args):
+                    scanned += 1
+                    if scanned % 250_000 == 0:
+                        yield emit("log", level="info",
+                                   msg=f"{table_name}: {scanned:,} source rows "
+                                       f"scanned, {staged:,} staged so far…")
                     src_pid = row[pfk]
                     if src_pid not in person_map:
                         continue
@@ -1101,7 +1268,18 @@ async def run_merge(cfg: MergeConfig) -> AsyncGenerator[str, None]:
 
                     row_data = dict(row)
                     row_data[pfk] = tgt_pid
-                    remapper.apply_row(row_data, fk_remaps)
+                    remapper.apply_row(row_data, inline_remaps)
+
+                    # Stash self-ref source values and NULL the column for the
+                    # insert; resolved in the second pass once the full
+                    # source->target map for this table exists.
+                    self_src = {}
+                    for col in self_remaps:
+                        if col in row_data:
+                            v = row_data[col]
+                            row_data[col] = None
+                            if v is not None:
+                                self_src[col] = v
 
                     if cfg.dedup_enabled and non_pk_dedup:
                         key = tuple(
@@ -1124,6 +1302,20 @@ async def run_merge(cfg: MergeConfig) -> AsyncGenerator[str, None]:
                         remapper.record(table_name, src_self_id, new_self_id)
                         mapping_log.add(table_name, src_self_id, new_self_id)
 
+                        # Only worth stashing for a live run — dry runs insert
+                        # nothing, so there is no row to UPDATE afterwards.
+                        if self_src and not cfg.dry_run:
+                            for col, v in self_src.items():
+                                ids_arr, refs_arr = deferred_selfref[col]
+                                # Coerce NUMERIC->Decimal to int, and upgrade
+                                # the int64 array to a list if an id exceeds
+                                # bigint range (see _append_id). The remapper
+                                # is already int-tolerant on lookup, including
+                                # for values beyond 2^63.
+                                ids_arr  = _append_id(ids_arr,  int(new_self_id))
+                                refs_arr = _append_id(refs_arr, int(v))
+                                deferred_selfref[col] = (ids_arr, refs_arr)
+
                     # NOTE on dedup semantics (changed in v1.5.5):
                     # `tgt_dedup_keys` only contains rows that existed in
                     # target *before* this run. We deliberately do NOT
@@ -1136,7 +1328,9 @@ async def run_merge(cfg: MergeConfig) -> AsyncGenerator[str, None]:
 
                     if cfg.dry_run:
                         inserted += 1
+                        staged += 1
                     else:
+                        staged += 1
                         await inserter.add(
                             tuple(row_data.get(c) for c in insert_cols)
                         )
@@ -1145,6 +1339,29 @@ async def run_merge(cfg: MergeConfig) -> AsyncGenerator[str, None]:
                     ins, skp = await inserter.flush()
                     inserted += ins
                     skipped  += skp
+
+                # Second pass: resolve self-referencing FKs now that this
+                # table's full source->target id map is known. The helper is
+                # a generator so its progress can be streamed — the insert
+                # phase and this phase are otherwise silent within a table.
+                if self_remaps and not cfg.dry_run and any(
+                    len(ids) for ids, _ in deferred_selfref.values()
+                ):
+                    remapped = left_null = 0
+                    async for item in apply_deferred_selfrefs(
+                        tgt, ts, table_name, self_pk,
+                        self_remaps, deferred_selfref, remapper,
+                    ):
+                        if isinstance(item, tuple) and item and item[0] == "__done__":
+                            _, remapped, left_null = item
+                        else:
+                            yield emit("log", level="info", msg=item)
+                    if remapped or left_null:
+                        detail = f"{remapped:,} resolved"
+                        if left_null:
+                            detail += f", {left_null:,} left NULL (referent out of scope)"
+                        yield emit("log", level="ok",
+                                   msg=f"{table_name}: self-referencing FKs — {detail}")
 
                 total_inserted += inserted
                 total_skipped  += skipped

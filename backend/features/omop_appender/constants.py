@@ -62,8 +62,9 @@ OMOP_TABLES = {
         "description": "Inpatient / outpatient visits",
         "person_fk": "person_id", "self_pk": "visit_occurrence_id", "visit_fk": None,
         "fk_remaps": {
-            "provider_id":  "provider",
-            "care_site_id": "care_site",
+            "provider_id":                  "provider",
+            "care_site_id":                 "care_site",
+            "preceding_visit_occurrence_id": "visit_occurrence",  # self-referencing
         },
         "dedup_cols": ["person_id", "visit_start_date", "visit_concept_id"], "insert_order": 5,
     },
@@ -74,6 +75,7 @@ OMOP_TABLES = {
         "fk_remaps": {
             "visit_occurrence_id":      "visit_occurrence",
             "parent_visit_detail_id":   "visit_detail",   # self-referencing
+            "preceding_visit_detail_id": "visit_detail",  # self-referencing
             "provider_id":              "provider",
             "care_site_id":             "care_site",
         },

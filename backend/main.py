@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from features.omop_appender.router import router as omop_appender_router
+from features.vocab_loader.router import router as vocab_loader_router
 
 app = FastAPI(title="OMOP Utility Suite", version="1.0.0")
 
@@ -33,7 +34,7 @@ app.add_middleware(
 # Add new features here as the project grows.
 
 app.include_router(omop_appender_router)
-
+app.include_router(vocab_loader_router)
 # ---------------------------------------------------------------------------
 # Static files (frontend SPA)
 # ---------------------------------------------------------------------------
