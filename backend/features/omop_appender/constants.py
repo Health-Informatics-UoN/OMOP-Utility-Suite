@@ -1,204 +1,176 @@
 """
 OMOP table metadata and runtime tunables for the merge feature.
 
-OMOP_TABLES
------------
-fk_remaps: dict mapping column_name -> id_map name.
-  Columns listed here will have their value looked up in the corresponding
-  IDRemapper map and replaced with the target ID before insert.
-  If the source ID is not found in the map the column is set to NULL.
+Table metadata is NOT defined here any more. It lives in an external YAML
+file — omop_appender_config.yaml in this folder — which is the single source
+of truth, so the table definitions are transparent and tunable without editing
+code. That file documents every field (person_fk, self_pk, fk_remaps,
+insert_order, dedup_cols, …) and the reasoning behind each dedup key.
 
-insert_order determines processing sequence — lower numbers run first so
-that referenced tables are populated before referencing ones.
-  1  care_site   (referenced by provider, person, visit_occurrence)
-  2  provider    (referenced by person, visit_occurrence, clinical tables)
-  3  person
-  4  death
-  5  visit_occurrence
-  6  visit_detail
-  7  clinical tables
-  8  derived tables
+This module loads and VALIDATES that file at import time and exposes
+OMOP_TABLES and ADMIN_TABLES exactly as before, so the rest of the package
+(logic.py, router.py) is unchanged. Because the file is authoritative, a
+missing or malformed file is a hard error at startup rather than a silent
+fallback — there is no in-code copy to fall back to.
+
+The streaming / batching tunables stay in code (bottom of this file): they are
+process-level knobs, not per-table configuration.
+
+Requires PyYAML (`pip install pyyaml`).
 """
 
-OMOP_TABLES = {
-    # ---- Reference / administrative (no person FK) -------------------------
-    "care_site": {
-        "label": "care_site", "domain": "admin",
-        "description": "Care sites / facilities",
-        "person_fk": None, "self_pk": "care_site_id", "visit_fk": None,
-        "fk_remaps": {},
-        "dedup_cols": ["care_site_source_value"], "insert_order": 1,
-    },
-    "provider": {
-        "label": "provider", "domain": "admin",
-        "description": "Clinicians and providers",
-        "person_fk": None, "self_pk": "provider_id", "visit_fk": None,
-        "fk_remaps": {
-            "care_site_id": "care_site",
-        },
-        "dedup_cols": ["provider_source_value"], "insert_order": 2,
-    },
-    # ---- Core --------------------------------------------------------------
-    "person": {
-        "label": "person", "domain": "core",
-        "description": "Demographics, DOB, gender, race",
-        "person_fk": "person_id", "self_pk": "person_id", "visit_fk": None,
-        "fk_remaps": {
-            "provider_id":  "provider",
-            "care_site_id": "care_site",
-        },
-        "dedup_cols": ["person_source_value"], "insert_order": 3,
-    },
-    "death": {
-        "label": "death", "domain": "core",
-        "description": "Cause of death records",
-        "person_fk": "person_id", "self_pk": None, "visit_fk": None,
-        "fk_remaps": {},
-        "dedup_cols": ["person_id"], "insert_order": 4,
-    },
-    # ---- Visit -------------------------------------------------------------
-    "visit_occurrence": {
-        "label": "visit_occurrence", "domain": "visit",
-        "description": "Inpatient / outpatient visits",
-        "person_fk": "person_id", "self_pk": "visit_occurrence_id", "visit_fk": None,
-        "fk_remaps": {
-            "provider_id":                  "provider",
-            "care_site_id":                 "care_site",
-            "preceding_visit_occurrence_id": "visit_occurrence",  # self-referencing
-        },
-        "dedup_cols": ["person_id", "visit_start_date", "visit_concept_id"], "insert_order": 5,
-    },
-    "visit_detail": {
-        "label": "visit_detail", "domain": "visit",
-        "description": "Sub-visit encounter detail",
-        "person_fk": "person_id", "self_pk": "visit_detail_id", "visit_fk": "visit_occurrence_id",
-        "fk_remaps": {
-            "visit_occurrence_id":      "visit_occurrence",
-            "parent_visit_detail_id":   "visit_detail",   # self-referencing
-            "preceding_visit_detail_id": "visit_detail",  # self-referencing
-            "provider_id":              "provider",
-            "care_site_id":             "care_site",
-        },
-        "dedup_cols": ["person_id", "visit_detail_start_date", "visit_detail_concept_id"], "insert_order": 6,
-    },
-    # ---- Clinical ----------------------------------------------------------
-    "condition_occurrence": {
-        "label": "condition_occurrence", "domain": "clinical",
-        "description": "Diagnoses and conditions",
-        "person_fk": "person_id", "self_pk": "condition_occurrence_id", "visit_fk": "visit_occurrence_id",
-        "fk_remaps": {
-            "visit_occurrence_id": "visit_occurrence",
-            "visit_detail_id":     "visit_detail",
-            "provider_id":         "provider",
-        },
-        "dedup_cols": ["person_id", "condition_concept_id", "condition_start_date"], "insert_order": 7,
-    },
-    "drug_exposure": {
-        "label": "drug_exposure", "domain": "clinical",
-        "description": "Medications and prescriptions",
-        "person_fk": "person_id", "self_pk": "drug_exposure_id", "visit_fk": "visit_occurrence_id",
-        "fk_remaps": {
-            "visit_occurrence_id": "visit_occurrence",
-            "visit_detail_id":     "visit_detail",
-            "provider_id":         "provider",
-        },
-        "dedup_cols": ["person_id", "drug_concept_id", "drug_exposure_start_date"], "insert_order": 7,
-    },
-    "measurement": {
-        "label": "measurement", "domain": "clinical",
-        "description": "Labs, vitals, test results",
-        "person_fk": "person_id", "self_pk": "measurement_id", "visit_fk": "visit_occurrence_id",
-        "fk_remaps": {
-            "visit_occurrence_id": "visit_occurrence",
-            "visit_detail_id":     "visit_detail",
-            "provider_id":         "provider",
-        },
-        "dedup_cols": ["person_id", "measurement_concept_id", "measurement_date"], "insert_order": 7,
-    },
-    "observation": {
-        "label": "observation", "domain": "clinical",
-        "description": "Clinical observations",
-        "person_fk": "person_id", "self_pk": "observation_id", "visit_fk": "visit_occurrence_id",
-        "fk_remaps": {
-            "visit_occurrence_id": "visit_occurrence",
-            "visit_detail_id":     "visit_detail",
-            "provider_id":         "provider",
-        },
-        "dedup_cols": ["person_id", "observation_concept_id", "observation_date"], "insert_order": 7,
-    },
-    "procedure_occurrence": {
-        "label": "procedure_occurrence", "domain": "clinical",
-        "description": "Surgeries and procedures",
-        "person_fk": "person_id", "self_pk": "procedure_occurrence_id", "visit_fk": "visit_occurrence_id",
-        "fk_remaps": {
-            "visit_occurrence_id": "visit_occurrence",
-            "visit_detail_id":     "visit_detail",
-            "provider_id":         "provider",
-        },
-        "dedup_cols": ["person_id", "procedure_concept_id", "procedure_date"], "insert_order": 7,
-    },
-    "device_exposure": {
-        "label": "device_exposure", "domain": "clinical",
-        "description": "Medical devices",
-        "person_fk": "person_id", "self_pk": "device_exposure_id", "visit_fk": "visit_occurrence_id",
-        "fk_remaps": {
-            "visit_occurrence_id": "visit_occurrence",
-            "visit_detail_id":     "visit_detail",
-            "provider_id":         "provider",
-        },
-        "dedup_cols": ["person_id", "device_concept_id", "device_exposure_start_date"], "insert_order": 7,
-    },
-    "specimen": {
-        "label": "specimen", "domain": "clinical",
-        "description": "Biological specimens",
-        "person_fk": "person_id", "self_pk": "specimen_id", "visit_fk": None,
-        "fk_remaps": {},
-        "dedup_cols": ["person_id", "specimen_concept_id", "specimen_date"], "insert_order": 7,
-    },
-    "note": {
-        "label": "note", "domain": "clinical",
-        "description": "Free-text clinical notes",
-        "person_fk": "person_id", "self_pk": "note_id", "visit_fk": "visit_occurrence_id",
-        "fk_remaps": {
-            "visit_occurrence_id": "visit_occurrence",
-            "visit_detail_id":     "visit_detail",
-            "provider_id":         "provider",
-        },
-        "dedup_cols": ["person_id", "note_date", "note_type_concept_id"], "insert_order": 7,
-    },
-    # ---- Derived -----------------------------------------------------------
-    "observation_period": {
-        "label": "observation_period", "domain": "derived",
-        "description": "Observation period windows",
-        "person_fk": "person_id", "self_pk": "observation_period_id", "visit_fk": None,
-        "fk_remaps": {},
-        "dedup_cols": ["person_id", "observation_period_start_date", "observation_period_end_date"], "insert_order": 8,
-    },
-    "condition_era": {
-        "label": "condition_era", "domain": "derived",
-        "description": "Derived condition eras",
-        "person_fk": "person_id", "self_pk": "condition_era_id", "visit_fk": None,
-        "fk_remaps": {},
-        "dedup_cols": ["person_id", "condition_concept_id", "condition_era_start_date"], "insert_order": 8,
-    },
-    "drug_era": {
-        "label": "drug_era", "domain": "derived",
-        "description": "Derived drug eras",
-        "person_fk": "person_id", "self_pk": "drug_era_id", "visit_fk": None,
-        "fk_remaps": {},
-        "dedup_cols": ["person_id", "drug_concept_id", "drug_era_start_date"], "insert_order": 8,
-    },
-    "dose_era": {
-        "label": "dose_era", "domain": "derived",
-        "description": "Derived dose eras",
-        "person_fk": "person_id", "self_pk": "dose_era_id", "visit_fk": None,
-        "fk_remaps": {},
-        "dedup_cols": ["person_id", "drug_concept_id", "dose_era_start_date"], "insert_order": 8,
-    },
+import os
+import sys
+import yaml
+
+
+# ---------------------------------------------------------------------------
+# Table metadata — loaded from omop_appender_config.yaml
+# ---------------------------------------------------------------------------
+# The config lives beside the feature's Python files (this omop_appender
+# folder), not at the server's working directory — so it is found no matter
+# where the app is launched from. An absolute OMOP_APPENDER_CONFIG env var
+# overrides this (e.g. a per-deployment config elsewhere on disk).
+DEFAULT_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "omop_appender_config.yaml"
+)
+
+# Required keys for every table entry, and the types each accepts. Validation
+# is strict because this file is authoritative: a missing or mistyped field can
+# break referential integrity (a wrong person_fk / insert_order / fk_remaps),
+# not merely dedup, so we refuse to start rather than merge with bad metadata.
+#   None-or-str : person_fk, self_pk, visit_fk   (a column name, or null)
+#   str         : label, domain, description
+#   int         : insert_order
+#   dict[str,str]: fk_remaps   (column_name -> id-map name)
+#   list[str]   : dedup_cols   (non-empty)
+_STR_FIELDS      = ("label", "domain", "description")
+_NULLABLE_STR    = ("person_fk", "self_pk", "visit_fk")
+_REQUIRED_FIELDS = _STR_FIELDS + _NULLABLE_STR + (
+    "fk_remaps", "dedup_cols", "insert_order",
+)
+# Optional fields a table may also declare:
+#   parent_fk  A column (also listed in fk_remaps) by which a non-per-patient
+#              child table is scoped through its parent — e.g. note_nlp.note_id
+#              -> note. Rows whose parent FK does not remap are skipped at merge
+#              time instead of being inserted with a dangling FK.
+_OPTIONAL_FIELDS = ("parent_fk",)
+
+
+def _fail(msg: str):
+    raise RuntimeError(f"OMOP Appender: {msg}")
+
+
+def _validate_table(name: str, meta) -> None:
+    """Validate one table entry's shape and types, raising on any problem."""
+    if not isinstance(meta, dict):
+        _fail(f"table '{name}' must be a mapping, got {type(meta).__name__}")
+
+    missing = [k for k in _REQUIRED_FIELDS if k not in meta]
+    if missing:
+        _fail(f"table '{name}' is missing required field(s): {', '.join(missing)}")
+    allowed = _REQUIRED_FIELDS + _OPTIONAL_FIELDS
+    unknown = [k for k in meta if k not in allowed]
+    if unknown:
+        _fail(f"table '{name}' has unknown field(s): {', '.join(unknown)}")
+
+    for k in _STR_FIELDS:
+        if not isinstance(meta[k], str):
+            _fail(f"table '{name}' field '{k}' must be a string")
+    for k in _NULLABLE_STR:
+        if not (meta[k] is None or isinstance(meta[k], str)):
+            _fail(f"table '{name}' field '{k}' must be a column name (string) or null")
+
+    # bool is a subclass of int — exclude it explicitly.
+    if not isinstance(meta["insert_order"], int) or isinstance(meta["insert_order"], bool):
+        _fail(f"table '{name}' field 'insert_order' must be an integer")
+
+    fkr = meta["fk_remaps"]
+    if not isinstance(fkr, dict) or not all(
+        isinstance(col, str) and isinstance(mapname, str)
+        for col, mapname in fkr.items()
+    ):
+        _fail(f"table '{name}' field 'fk_remaps' must be a mapping of "
+              f"column name -> id-map name (all strings)")
+
+    dc = meta["dedup_cols"]
+    if not isinstance(dc, list) or not dc or not all(isinstance(c, str) for c in dc):
+        _fail(f"table '{name}' field 'dedup_cols' must be a non-empty list of "
+              f"column-name strings (got {dc!r})")
+
+    pfk = meta.get("parent_fk")
+    if pfk is not None:
+        if not isinstance(pfk, str):
+            _fail(f"table '{name}' field 'parent_fk' must be a column-name string")
+        if pfk not in fkr:
+            _fail(f"table '{name}' field 'parent_fk' ('{pfk}') must also appear in "
+                  f"fk_remaps so it can be remapped to the target parent row")
+
+
+def load_omop_tables(path=None) -> dict:
+    """Load and validate the table metadata from the YAML config.
+
+    Args:
+        path: Explicit config path. Defaults to the ``OMOP_APPENDER_CONFIG``
+            environment variable, then ``DEFAULT_CONFIG_PATH``.
+
+    Returns:
+        The ``{table_name: metadata}`` mapping.
+
+    Raises:
+        RuntimeError: If the file is absent, unreadable, not valid YAML, or
+            structurally invalid. There is deliberately no in-code fallback,
+            so any problem fails loudly at startup rather than merging with
+            incomplete metadata.
+    """
+    cfg_path = path or os.environ.get("OMOP_APPENDER_CONFIG", DEFAULT_CONFIG_PATH)
+
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh)
+    except FileNotFoundError:
+        _fail(f"table config not found at '{cfg_path}'. This file is the single "
+              f"source of truth for table metadata and is required to start. "
+              f"Restore omop_appender_config.yaml in the omop_appender folder, "
+              f"or set OMOP_APPENDER_CONFIG to point at a copy.")
+    except OSError as e:
+        _fail(f"could not read table config '{cfg_path}': {e}")
+    except yaml.YAMLError as e:
+        _fail(f"table config '{cfg_path}' is not valid YAML: {e}")
+
+    if not isinstance(raw, dict) or "tables" not in raw:
+        _fail(f"table config '{cfg_path}' must be a mapping with a top-level "
+              f"'tables:' section")
+
+    tables = raw["tables"]
+    if not isinstance(tables, dict) or not tables:
+        _fail(f"'tables' in '{cfg_path}' must be a non-empty mapping of "
+              f"table name -> metadata")
+
+    for name, meta in tables.items():
+        _validate_table(name, meta)
+
+    return dict(tables)
+
+
+OMOP_TABLES = load_omop_tables()
+
+# Tables that have no person_fk AND are not parent-scoped child tables — i.e.
+# true admin/reference tables (care_site, provider). A parent-scoped child such
+# as note_nlp also has no person_fk but must NOT take the admin path (that path
+# cannot remap its parent FK), so it is excluded here and handled by its own
+# branch in logic.py.
+ADMIN_TABLES = {
+    name for name, m in OMOP_TABLES.items()
+    if m["person_fk"] is None and not m.get("parent_fk")
 }
 
-# Tables that have no person_fk (admin/reference tables).
-ADMIN_TABLES = {name for name, m in OMOP_TABLES.items() if m["person_fk"] is None}
+print(
+    f"OMOP Appender: loaded {len(OMOP_TABLES)} table definitions from config "
+    f"({os.environ.get('OMOP_APPENDER_CONFIG', DEFAULT_CONFIG_PATH)})",
+    file=sys.stderr, flush=True,
+)
+
 
 # ---------------------------------------------------------------------------
 # Streaming / batching tunables

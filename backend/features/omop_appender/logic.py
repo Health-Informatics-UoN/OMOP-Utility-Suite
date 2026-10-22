@@ -62,6 +62,41 @@ def _append_id(container, value: int):
     return container
 
 
+def _id_array_param(ids):
+    """
+    Build the ``(cast, values)`` pair for an ``id_col = ANY($1::<cast>)`` filter.
+
+    OMOP ids usually fit a signed 64-bit integer, but two things break a naive
+    ``$1::bigint[]`` cast:
+      * NUMERIC id columns come back from asyncpg as ``Decimal`` objects, and
+      * some sites use hash-derived ids that exceed the int64 range entirely
+        (a 19-digit id can be up to ~9.9e18, past the ~9.2e18 int64 ceiling),
+        which must therefore live in a NUMERIC column.
+
+    So: coerce each id to ``int`` where possible and use ``bigint[]`` (which is
+    index-friendly for the common bigint person_id column) when every value
+    fits signed 64-bit; fall back to ``numeric[]`` only when one does not. The
+    values are passed through in a form asyncpg can encode for the chosen cast
+    (plain ``int`` for bigint[]; ``int``/``Decimal`` for numeric[]).
+    """
+    out = []
+    needs_numeric = False
+    for v in ids:
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            # Non-integral (shouldn't happen for ids) — let numeric[] carry it.
+            needs_numeric = True
+            out.append(v)
+            continue
+        if _Q_MIN <= iv <= _Q_MAX:
+            out.append(iv)
+        else:
+            needs_numeric = True
+            out.append(v)   # keep original value for numeric encoding
+    return ("numeric[]" if needs_numeric else "bigint[]"), out
+
+
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
@@ -98,39 +133,37 @@ async def get_columns(conn, schema, table):
 # ---------------------------------------------------------------------------
 
 async def iter_rows(conn, query: str, *args, batch_size: int = FETCH_BATCH):
-    """
-    Stream rows from `query` via a server-side cursor.
+    """Stream rows from a query via a server-side cursor, in constant memory.
 
-    Must be called inside a transaction (asyncpg requirement). Yields
-    `Record` objects one at a time but only `batch_size` are held in
-    memory at once because `cursor.fetch(batch_size)` is what physically
-    talks to the server.
+    Only ``batch_size`` rows are held at once — ``cursor.fetch(batch_size)`` is
+    what physically round-trips to the server — so a full-table scan never
+    materialises the whole result set in Python. Must be called inside a
+    transaction (an asyncpg requirement for cursors); this function opens and
+    closes one itself.
 
-    Cancellation safety
-    -------------------
-    If the consumer abandons this generator mid-stream (e.g. the merge
-    loop raises MergeRowError and Python tears the `async for` down with
-    GeneratorExit), the cursor still has unfetched batches on the wire.
-    asyncpg's transaction __aexit__ then issues ROLLBACK on top of that
-    pending state and crashes with "got result for unknown protocol
-    state 3". Worse, that crash propagates *out* of the generator,
-    masking the original MergeRowError and breaking the StreamingResponse
-    so the frontend never sees an error event at all.
+    Args:
+        conn: An asyncpg connection.
+        query: The SQL to execute.
+        *args: Positional query parameters.
+        batch_size: Rows fetched from the server per round-trip.
 
-    We can't use `async with conn.transaction()` because its __aexit__
-    runs BEFORE any except clause we put around it — that's the order
-    Python defines for context managers inside try blocks. Instead we
-    drive the transaction manually so we can detect mid-stream
-    cancellation (GeneratorExit) and forcibly terminate the connection
-    *before* asyncpg ever tries to issue ROLLBACK on the dirty protocol
-    state. The merge endpoint's outer finally block tolerates a
-    terminated connection, and the original upstream exception (e.g.
-    MergeRowError) then propagates cleanly to the structured error
-    handler.
+    Yields:
+        asyncpg ``Record`` objects, one at a time.
 
-    This is the workhorse of the v1.3 memory pass: replacing
-    `await conn.fetch(...)` with `async for r in iter_rows(...)` turns a
-    full-table materialisation into a constant-memory stream.
+    Note:
+        The transaction is driven manually rather than with
+        ``async with conn.transaction()`` to stay correct when the consumer
+        abandons the generator mid-stream (e.g. the merge loop raises
+        ``MergeRowError`` and Python tears the ``async for`` down with
+        ``GeneratorExit``). At that point the cursor still has unfetched
+        batches on the wire; letting asyncpg's transaction exit issue a
+        ROLLBACK on top of that dirty protocol state crashes with "got result
+        for unknown protocol state 3", which would mask the original exception
+        and break the streaming response. A context manager's ``__aexit__``
+        runs before any surrounding ``except``, so instead the connection is
+        forcibly terminated on ``GeneratorExit`` before any cleanup statement
+        reaches the wire; the caller's outer ``finally`` tolerates a
+        terminated connection and the original exception propagates cleanly.
     """
     tx = conn.transaction()
     await tx.start()
@@ -257,17 +290,20 @@ class MergeRowError(Exception):
 # ---------------------------------------------------------------------------
 
 class BatchInserter:
-    """
-    Accumulates rows for one table and flushes them with `executemany`
-    every INSERT_BATCH rows.
+    """Buffers rows for one table and flushes them with ``executemany``.
 
-    Error handling
-    --------------
-    * UniqueViolationError → fall back to per-row inserts, count collisions
-      as "skipped". Preserves v1.2 dedup behaviour.
-    * Any other PostgresError → fall back to per-row inserts to find the
-      exact failing row, then raise MergeRowError with full context
-      (table, SQL, column→value mapping, sqlstate, PG message).
+    Rows accumulate until ``INSERT_BATCH`` is reached (or ``flush()`` is called)
+    and are then sent in a single round-trip. On error the batch is retried
+    row-by-row inside a savepoint to isolate the offending row:
+
+    * ``UniqueViolationError`` on a row is treated as a duplicate — counted as
+      "skipped" rather than raised, so a pre-existing target row is a no-op.
+    * Any other ``PostgresError`` is re-raised as ``MergeRowError`` with full
+      context (table, SQL, column-to-value mapping, sqlstate, PG message).
+
+    Attributes:
+        inserted: Count of rows successfully inserted.
+        skipped: Count of rows skipped as duplicates.
     """
 
     def __init__(self, conn, schema: str, table: str, cols: list[str]):
@@ -504,27 +540,31 @@ def emit(type_: str, **kwargs) -> str:
 
 async def build_person_map(src, tgt, ss, ts, limit: int | None = None,
                             limit_to_existing: bool = False):
-    """
-    Returns person_map: source_person_id -> {
-        source_value: str | None,
-        target_person_id: int | None,   # None = not yet in target
-        target_found: bool,
-    }
+    """Build the source-to-target patient identity map.
 
-    Patients are matched across DBs by person_source_value.
+    Patients are matched across the two databases by ``person_source_value``.
+    Everything downstream is keyed on the returned map, so sampling here bounds
+    the size of the whole scan and merge.
 
-    Sampling
-    --------
-    If `limit` is set, only the first `limit` source patients (ordered by
-    person_id ascending) are returned in the map. Everything downstream
-    is keyed on this map, so a small map ⇒ small scan and small merge.
+    Args:
+        src: Source database connection.
+        tgt: Target database connection.
+        ss: Source schema name.
+        ts: Target schema name.
+        limit: If set, keep only the first ``limit`` source patients (ordered
+            by ``person_id``), for sample runs.
+        limit_to_existing: When sampling, restrict the sample to source
+            patients whose ``person_source_value`` also exists in the target.
 
-    If `limit_to_existing` is True, sampling picks the first `limit`
-    source patients whose person_source_value also exists in the target.
+    Returns:
+        A dict mapping each source ``person_id`` to::
 
-    FIX (v1.2): previously `sv = r["person_id"]` caused every patient to be
-    keyed on their numeric ID rather than their source value, so cross-DB
-    matching always failed silently.
+            {
+                "source_value": str | None,
+                "target_person_id": int | None,   # None if not yet in target
+                "target_found": bool,
+                "match_type": str,
+            }
     """
     tgt_persons = await tgt.fetch(
         f'SELECT person_id, person_source_value FROM "{ts}"."person"'
@@ -590,11 +630,12 @@ async def get_tgt_dedup_keys(tgt, ts, table_name, pfk, dedup_cols, tgt_cols, tgt
         return set(), non_pk_dedup
     col_list = ", ".join(f'"{c}"' for c in non_pk_dedup)
     keys: set = set()
+    cast, id_params = _id_array_param(tgt_person_ids)
     sql = (
         f'SELECT "{pfk}", {col_list} FROM "{ts}"."{table_name}" '
-        f'WHERE "{pfk}" = ANY($1::bigint[])'
+        f'WHERE "{pfk}" = ANY($1::{cast})'
     )
-    async for r in iter_rows(tgt, sql, tgt_person_ids, batch_size=DEDUP_FETCH_BATCH):
+    async for r in iter_rows(tgt, sql, id_params, batch_size=DEDUP_FETCH_BATCH):
         keys.add(tuple([r[pfk]] + [r[c] for c in non_pk_dedup]))
     return keys, non_pk_dedup
 
@@ -629,16 +670,18 @@ def build_clinical_source_query(schema: str, table: str, pfk: str,
     streams matching rows. This is the chokepoint that makes sample
     mode actually fast on huge clinical tables.
 
-    The cast is `bigint[]` rather than `int[]` because some sites use
-    BIGINT person_ids (often hash-derived, sometimes negative) that
-    overflow int32.
+    The array cast is chosen by _id_array_param: bigint[] when every id fits
+    signed 64-bit (the common, index-friendly case), numeric[] when a
+    hash-derived id exceeds it or the column is NUMERIC (asyncpg returns those
+    as Decimal). int[] is never used because BIGINT person_ids overflow int32.
     """
     if person_ids is None:
         return f'SELECT * FROM "{schema}"."{table}"', ()
+    cast, id_params = _id_array_param(person_ids)
     return (
         f'SELECT * FROM "{schema}"."{table}" '
-        f'WHERE "{pfk}" = ANY($1::bigint[])',
-        (person_ids,),
+        f'WHERE "{pfk}" = ANY($1::{cast})',
+        (id_params,),
     )
 
 
@@ -650,53 +693,46 @@ async def apply_deferred_selfrefs(
     tgt, ts, table_name, self_pk, self_remaps, deferred, remapper,
     batch=20_000,
 ):
-    """
-    Second pass for self-referencing FK columns, e.g.
-    visit_occurrence.preceding_visit_occurrence_id and
-    visit_detail.parent_visit_detail_id / preceding_visit_detail_id.
+    """Resolve self-referencing FK columns in a second pass after insertion.
 
-    Why a second pass
-    -----------------
-    A self-referencing FK points at another row of the *same* table, which
-    may not have been inserted yet when the referencing row is processed —
-    the source cursor yields rows in arbitrary order, and a "preceding"
-    visit can legitimately appear *after* the visit that references it.
-    Remapping such a column inline (via IDRemapper.remap during the insert
-    loop) would resolve every forward reference to None and silently NULL
-    it. Worse, if the column is left carrying the raw *source* id, a source
-    that uses BIGINT ids will overflow a target INT column and abort the
-    insert — which is the failure mode this fixes.
+    Some tables reference another row of themselves, e.g.
+    ``visit_occurrence.preceding_visit_occurrence_id`` and
+    ``visit_detail.parent_visit_detail_id`` /
+    ``preceding_visit_detail_id``. Because the source cursor yields rows in
+    arbitrary order, a referenced row may not be inserted yet when the
+    referencing row is processed, so remapping such a column inline would
+    resolve forward references to NULL. Carrying the raw source id instead
+    risks overflowing a narrower target column and aborting the insert.
 
-    So during the insert pass these columns are written as NULL and their
-    source values stashed in `deferred`. By the time we get here the
-    remapper holds the complete source->target map for this table, so every
-    in-scope reference resolves correctly regardless of insertion order.
-    References whose target row was not part of this merge (out of scope,
-    filtered by patient sampling, or dedup-skipped) resolve to None and are
-    left NULL — the same, spec-valid outcome as before, just no longer the
-    *only* outcome.
+    To avoid both, the insert pass writes these columns as NULL and stashes
+    their source values in ``deferred``. By the time this runs the remapper
+    holds the complete source-to-target id map for the table, so every
+    in-scope reference resolves regardless of insertion order. References
+    whose target row was not part of this merge (out of scope, filtered by
+    sampling, or dedup-skipped) remain NULL, which is spec-valid.
 
-    Memory & round-trips
-    --------------------
-    `deferred` is a dict {col: (self_ids, src_refs)} where each value is a
-    pair of `array('q')` columns (see the merge loop). Arrays store 8 bytes
-    per id rather than the ~250 bytes a list-of-dicts costs, so even a few
-    million deferred rows stay well under 100 MB — the previous list form
-    roughly doubled the per-visit footprint already held by the remapper
-    and could tip a full run into swap.
+    Each FK column is updated in batches of ``batch`` rows with one set-based
+    statement — ``UPDATE ... SET col = d.tgt FROM unnest($1, $2) AS
+    d(self_id, tgt) WHERE self_pk = d.self_id`` — giving ``n / batch``
+    round-trips instead of one UPDATE per row.
 
-    Each batch of `batch` rows is applied with ONE set-based statement:
+    Args:
+        tgt: Target database connection.
+        ts: Target schema name.
+        table_name: Table being updated.
+        self_pk: The table's surrogate primary key column.
+        self_remaps: Mapping of ``{self_referencing_column: id_map_name}``.
+        deferred: ``{column: (self_ids, src_refs)}`` where each value is a pair
+            of parallel ``array('q')`` buffers populated during the insert
+            pass. Packed arrays keep even a few million deferred rows well
+            within a bounded memory footprint.
+        remapper: The populated ``IDRemapper`` for resolving references.
+        batch: Rows per UPDATE round-trip.
 
-        UPDATE ... v SET col = d.tgt
-        FROM unnest($1::bigint[], $2::bigint[]) AS d(self_id, tgt)
-        WHERE v.self_pk = d.self_id
-
-    i.e. N/batch round-trips instead of one UPDATE per row.
-
-    This is a generator: it yields human-readable progress strings so the
-    caller can surface them on the NDJSON stream (the insert phase and this
-    phase are otherwise silent within a table). The final item yielded is
-    the ("__done__", remapped, left_null) sentinel tuple.
+    Yields:
+        Human-readable progress strings for the caller to surface on the
+        stream, then a final ``("__done__", remapped, left_null)`` sentinel
+        tuple with the resolved and left-NULL counts.
     """
     remapped = 0
     left_null = 0
@@ -858,6 +894,43 @@ async def diff_scan(req: ScanRequest) -> AsyncGenerator[str, None]:
                 }
                 yield emit("table_scan", table=table_name,
                            new_rows=new_rows_count, affected_patients=0)
+                continue
+
+            # Parent-scoped child tables (e.g. note_nlp). The scan is read-only
+            # and has no id remapper, so the parent FK can't be resolved here;
+            # we give an APPROXIMATE count by deduping on the non-parent key
+            # columns only. The merge does the exact, parent-scoped dedup.
+            if OMOP_TABLES[table_name].get("parent_fk"):
+                parent_fk = OMOP_TABLES[table_name]["parent_fk"]
+                tgt_cols = await get_columns(tgt, ts, table_name)
+                scan_dedup = [c for c in dedup_cols
+                              if c != parent_fk and c in tgt_cols]
+                tgt_keys = set()
+                if scan_dedup:
+                    col_list = ", ".join(f'"{c}"' for c in scan_dedup)
+                    async for r in iter_rows(
+                        tgt, f'SELECT {col_list} FROM "{ts}"."{table_name}"',
+                        batch_size=DEDUP_FETCH_BATCH,
+                    ):
+                        tgt_keys.add(tuple(r[c] for c in scan_dedup))
+                new_rows_count = 0
+                async for row in iter_rows(
+                    src, f'SELECT * FROM "{ss}"."{table_name}"'
+                ):
+                    if scan_dedup:
+                        key = tuple(row[c] for c in scan_dedup)
+                        if key in tgt_keys:
+                            continue
+                    new_rows_count += 1
+                table_totals[table_name] = {
+                    "new_rows": new_rows_count, "affected_patients": 0,
+                    "approximate": True,
+                }
+                yield emit("table_scan", table=table_name,
+                           new_rows=new_rows_count, affected_patients=0)
+                yield emit("log", level="info",
+                           msg=f"{table_name}: ~{new_rows_count} new rows "
+                               f"(approximate — scoped via {parent_fk} at merge time)")
                 continue
 
             if table_name == "person":
@@ -1115,6 +1188,101 @@ async def run_merge(cfg: MergeConfig) -> AsyncGenerator[str, None]:
                                    f"{skipped} skipped")
                     continue
 
+                # ---- PARENT-SCOPED CHILD TABLES ----------------------------
+                # Tables with no person_fk that hang off another table by a FK
+                # rather than off the patient — e.g. note_nlp -> note. They are
+                # scoped THROUGH their parent: a row is kept only if its parent
+                # FK remaps to a row imported/matched earlier in this run (the
+                # parent table has a higher-priority insert_order). A row whose
+                # parent did not map (out of scope, or a parent that was
+                # dedup-skipped and so never recorded) is skipped rather than
+                # inserted with a dangling NULL FK.
+                parent_fk = meta.get("parent_fk")
+                if parent_fk:
+                    parent_map = fk_remaps.get(parent_fk)
+                    if parent_map is None:
+                        yield emit("log", level="warn",
+                                   msg=f"{table_name}: parent_fk '{parent_fk}' "
+                                       f"has no fk_remaps entry — skipping table")
+                        continue
+
+                    # Target dedup keys (already in target id space). The key
+                    # may include the parent FK; the target already stores it as
+                    # a target id, and the source side is remapped below, so the
+                    # two compare in the same space.
+                    non_pk_dedup = (
+                        [c for c in dedup_cols if c in tgt_cols]
+                        if cfg.dedup_enabled else []
+                    )
+                    tgt_keys: set = set()
+                    if non_pk_dedup:
+                        col_list = ", ".join(f'"{c}"' for c in non_pk_dedup)
+                        async for r in iter_rows(
+                            tgt,
+                            f'SELECT {col_list} FROM "{ts}"."{table_name}"',
+                            batch_size=DEDUP_FETCH_BATCH,
+                        ):
+                            tgt_keys.add(tuple(r[c] for c in non_pk_dedup))
+
+                    if self_pk and cfg.id_strategy == "auto":
+                        await pk_counter.init_table(tgt, ts, table_name, self_pk)
+
+                    insert_cols = list(common_cols)
+                    inserter = (
+                        BatchInserter(tgt, ts, table_name, insert_cols)
+                        if not cfg.dry_run else None
+                    )
+                    inserted = skipped = 0
+
+                    async for row in iter_rows(
+                        src, f'SELECT * FROM "{ss}"."{table_name}"'
+                    ):
+                        row_data = dict(row)
+                        remapper.apply_row(row_data, fk_remaps)
+
+                        # Scope via the parent: unmapped parent -> skip (no orphan).
+                        if row_data.get(parent_fk) is None:
+                            skipped += 1
+                            continue
+
+                        if non_pk_dedup:
+                            key = tuple(row_data.get(c) for c in non_pk_dedup)
+                            if key in tgt_keys:
+                                skipped += 1
+                                continue
+
+                        if self_pk and self_pk in row_data:
+                            src_self_id = row[self_pk]
+                            if cfg.id_strategy == "preserve":
+                                new_self_id = src_self_id
+                            elif cfg.id_strategy == "offset":
+                                new_self_id = src_self_id + cfg.id_offset
+                            else:
+                                new_self_id = pk_counter.next(table_name)
+                            row_data[self_pk] = new_self_id
+                            remapper.record(table_name, src_self_id, new_self_id)
+                            mapping_log.add(table_name, src_self_id, new_self_id)
+
+                        if cfg.dry_run:
+                            inserted += 1
+                        else:
+                            await inserter.add(
+                                tuple(row_data.get(c) for c in insert_cols)
+                            )
+
+                    if inserter is not None:
+                        ins, skp = await inserter.flush()
+                        inserted += ins
+                        skipped  += skp
+
+                    total_inserted += inserted
+                    total_skipped  += skipped
+                    yield emit("log", level="ok",
+                               msg=f"{table_name}: {inserted} "
+                                   f"{'would be ' if cfg.dry_run else ''}inserted, "
+                                   f"{skipped} skipped (scoped via {parent_fk})")
+                    continue
+
                 # ---- PERSON ------------------------------------------------
                 if table_name == "person":
                     inserted = skipped = 0
@@ -1316,15 +1484,15 @@ async def run_merge(cfg: MergeConfig) -> AsyncGenerator[str, None]:
                                 refs_arr = _append_id(refs_arr, int(v))
                                 deferred_selfref[col] = (ids_arr, refs_arr)
 
-                    # NOTE on dedup semantics (changed in v1.5.5):
-                    # `tgt_dedup_keys` only contains rows that existed in
-                    # target *before* this run. We deliberately do NOT
-                    # add this row's key to the set after inserting,
-                    # because clinical OMOP data legitimately has many
-                    # rows sharing (person_id, concept_id, date) — daily
-                    # vitals, repeated lab panels, ICU monitoring, etc.
-                    # MIMIC-IV-on-OMOP is a canonical example. Within-
-                    # run dedup was silently dropping ~96% of such rows.
+                    # Dedup semantics: `tgt_dedup_keys` holds only rows that
+                    # existed in the target before this run, and a row's key is
+                    # deliberately NOT added to the set after inserting. Clinical
+                    # OMOP data legitimately contains many rows sharing a coarse
+                    # key such as (person_id, concept_id, date) — daily vitals,
+                    # repeated lab panels, ICU monitoring — so collapsing within
+                    # a single run would drop genuine records. Dedup therefore
+                    # protects against re-importing what the target already had,
+                    # not against repeats within one source extract.
 
                     if cfg.dry_run:
                         inserted += 1
